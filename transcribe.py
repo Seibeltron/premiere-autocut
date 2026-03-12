@@ -1,21 +1,69 @@
 #!/usr/bin/env python3
 """
-transcribe.py — Word-accurate transcription using faster-whisper.
+transcribe.py — Word-accurate transcription using OpenAI Whisper API.
 Outputs JSON to stdout: {segments, words, total_duration, method}
+
+Results are cached in ~/.cache/resolve-autocut/ keyed by file path + mtime.
+Re-running on the same file returns the cached result instantly.
 
 Usage:
     python transcribe.py /path/to/video.mp4
     python transcribe.py /path/to/video.mp4 > transcript.json
+    python transcribe.py /path/to/video.mp4 --no-cache
 """
 
+import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Dict, List
 
 
 WORD_PAD_S = 0.05  # 50ms padding on each word boundary
+CACHE_DIR = Path.home() / ".cache" / "resolve-autocut"
 
+
+# ---------------------------------------------------------------------------
+# Caching
+# ---------------------------------------------------------------------------
+
+def _cache_key(video_path: str) -> str:
+    """Return a stable cache key based on absolute path + mtime + size."""
+    p = Path(video_path).resolve()
+    stat = p.stat()
+    raw = f"{p}:{stat.st_mtime}:{stat.st_size}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def _cache_path(video_path: str) -> Path:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    key = _cache_key(video_path)
+    name = Path(video_path).stem[:40]
+    return CACHE_DIR / f"{name}_{key}.json"
+
+
+def load_cached(video_path: str) -> Dict | None:
+    cp = _cache_path(video_path)
+    if cp.exists():
+        try:
+            return json.loads(cp.read_text())
+        except Exception:
+            cp.unlink(missing_ok=True)
+    return None
+
+
+def save_cache(video_path: str, result: Dict) -> None:
+    try:
+        cp = _cache_path(video_path)
+        cp.write_text(json.dumps(result))
+    except Exception:
+        pass  # cache write failure is non-fatal
+
+
+# ---------------------------------------------------------------------------
+# Segment building / scoring
+# ---------------------------------------------------------------------------
 
 def _pad_words(words: List[Dict]) -> List[Dict]:
     return [
@@ -68,9 +116,8 @@ def build_segments(raw_segments: List[Dict], min_dur: float = 1.0, max_dur: floa
             buf = seg.copy()
     merged.append(buf)
 
-    # Split long segments at the biggest pause gap
-    final = []
-    for seg in merged:
+    # Split long segments recursively at the biggest pause gap
+    def _split_seg(seg):
         dur = seg["end"] - seg["start"]
         words = seg.get("words", [])
         if dur > max_dur and len(words) >= 4:
@@ -81,12 +128,16 @@ def build_segments(raw_segments: List[Dict], min_dur: float = 1.0, max_dur: floa
                     best_gap, best_idx = g, i
             if best_idx > 0 and best_gap > 0.15:
                 lw, rw = words[:best_idx], words[best_idx:]
-                final.append({"start": seg["start"], "end": lw[-1]["end"],
-                               "text": " ".join(w["word"] for w in lw).strip(), "words": lw})
-                final.append({"start": rw[0]["start"], "end": seg["end"],
-                               "text": " ".join(w["word"] for w in rw).strip(), "words": rw})
-                continue
-        final.append(seg)
+                left = {"start": seg["start"], "end": lw[-1]["end"],
+                        "text": " ".join(w["word"] for w in lw).strip(), "words": lw}
+                right = {"start": rw[0]["start"], "end": seg["end"],
+                         "text": " ".join(w["word"] for w in rw).strip(), "words": rw}
+                return _split_seg(left) + _split_seg(right)
+        return [seg]
+
+    final = []
+    for seg in merged:
+        final.extend(_split_seg(seg))
 
     output = []
     for seg in final:
@@ -146,73 +197,141 @@ def score_segments(
     return scored
 
 
+# ---------------------------------------------------------------------------
+# OpenAI Whisper transcription
+# ---------------------------------------------------------------------------
+
+MAX_BYTES = 24 * 1024 * 1024   # 24MB — stay under OpenAI's 25MB limit
+CHUNK_SECS = 600               # 10-minute chunks for long files
+CHUNK_OVERLAP = 5              # 5s overlap between chunks to avoid boundary gaps
+
+
+def _extract_audio(video_path: str, out_path: str,
+                   ss: float = 0.0, duration: float = None) -> None:
+    """Extract mono 64kbps mp3 from video using ffmpeg."""
+    import subprocess
+    cmd = ["ffmpeg", "-y", "-i", video_path, "-vn",
+           "-acodec", "libmp3lame", "-ab", "64k", "-ac", "1", "-ar", "16000"]
+    if ss > 0:
+        cmd += ["-ss", str(ss)]
+    if duration:
+        cmd += ["-t", str(duration)]
+    cmd.append(out_path)
+    subprocess.run(cmd, capture_output=True, check=True)
+
+
+def _transcribe_chunk(client, audio_path: str, offset: float = 0.0) -> List[Dict]:
+    """Call OpenAI Whisper API on an audio file, return words with timestamps offset."""
+    with open(audio_path, "rb") as f:
+        response = client.audio.transcriptions.create(
+            model="whisper-1",
+            file=f,
+            response_format="verbose_json",
+            timestamp_granularities=["word"],
+            language="en",
+        )
+    words = []
+    for w in getattr(response, "words", None) or []:
+        words.append({
+            "word": w.word,
+            "start": float(w.start) + offset,
+            "end": float(w.end) + offset,
+            "probability": 0.9,  # OpenAI doesn't expose per-word confidence
+        })
+    return words
+
+
 def transcribe(video_path: str) -> Dict:
+    import tempfile
     try:
-        from faster_whisper import WhisperModel
+        from openai import OpenAI
     except ImportError:
-        return {"error": "faster-whisper not installed. Run: pip install faster-whisper"}
+        return {"error": "openai not installed. Run: pip install openai"}
 
-    model = WhisperModel("large-v3", device="cpu", compute_type="int8")
-    raw_segments, _info = model.transcribe(
-        video_path,
-        beam_size=1,
-        language="en",
-        vad_filter=True,
-        vad_parameters=dict(min_silence_duration_ms=500, speech_pad_ms=400),
-        word_timestamps=True,
-    )
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        return {"error": "OPENAI_API_KEY environment variable not set"}
 
-    all_words = []
-    raw = []
-    for seg in raw_segments:
-        words = []
-        for w in getattr(seg, "words", None) or []:
-            words.append({
-                "word": getattr(w, "word", ""),
-                "start": float(getattr(w, "start", 0.0)),
-                "end": float(getattr(w, "end", 0.0)),
-                "probability": float(getattr(w, "probability", 0.8) or 0.8),
-            })
-        all_words.extend(words)
-        raw.append({"start": float(seg.start), "end": float(seg.end),
-                    "text": seg.text.strip(), "words": words})
+    base_url = os.environ.get("OPENAI_BASE_URL", "https://proxy.shopify.ai/v1")
+    client = OpenAI(api_key=api_key, base_url=base_url)
 
-    if not raw:
+    with tempfile.TemporaryDirectory() as tmp:
+        # Extract full audio first to check size
+        full_mp3 = f"{tmp}/full.mp3"
+        print("Extracting audio...", file=sys.stderr)
+        _extract_audio(video_path, full_mp3)
+        size = os.path.getsize(full_mp3)
+        print(f"Audio size: {size / 1024 / 1024:.1f}MB", file=sys.stderr)
+
+        all_words: List[Dict] = []
+
+        if size <= MAX_BYTES:
+            # Single API call
+            print("Transcribing via OpenAI Whisper...", file=sys.stderr)
+            all_words = _transcribe_chunk(client, full_mp3, offset=0.0)
+        else:
+            # Chunk into 10-minute pieces with 5s overlap
+            import subprocess, json as _json
+            probe = subprocess.run(
+                ["ffprobe", "-v", "quiet", "-print_format", "json",
+                 "-show_format", video_path],
+                capture_output=True, text=True)
+            total = float(_json.loads(probe.stdout)["format"]["duration"])
+            starts = list(range(0, int(total), CHUNK_SECS - CHUNK_OVERLAP))
+            print(f"File too large — splitting into {len(starts)} chunks...", file=sys.stderr)
+            seen_ends: set = set()
+            for i, start in enumerate(starts):
+                chunk_mp3 = f"{tmp}/chunk_{i}.mp3"
+                dur = min(CHUNK_SECS, total - start + CHUNK_OVERLAP)
+                _extract_audio(video_path, chunk_mp3, ss=start, duration=dur)
+                print(f"  Transcribing chunk {i+1}/{len(starts)} "
+                      f"({start:.0f}s–{start+dur:.0f}s)...", file=sys.stderr)
+                chunk_words = _transcribe_chunk(client, chunk_mp3, offset=start)
+                # Deduplicate overlap: skip words whose rounded end was already seen
+                for w in chunk_words:
+                    key = round(w["end"], 1)
+                    if key not in seen_ends:
+                        all_words.append(w)
+                        seen_ends.add(key)
+
+    if not all_words:
         return {"error": "No speech detected"}
 
     all_words = _pad_words(all_words)
-
-    # Re-assign padded words back into raw segments
-    idx = 0
-    for seg in raw:
-        n = len(seg["words"])
-        seg["words"] = all_words[idx:idx + n]
-        if seg["words"]:
-            seg["start"] = seg["words"][0]["start"]
-            seg["end"] = seg["words"][-1]["end"]
-        idx += n
-
+    raw = list(_words_to_segments(all_words))
     segments = build_segments(raw)
-    total_dur = max((w["end"] for w in all_words), default=0.0)
+    total_dur = max(w["end"] for w in all_words)
     segments = score_segments(segments, total_dur)
 
     return {
         "segments": segments,
         "words": all_words,
         "total_duration": total_dur,
-        "method": "faster-whisper",
+        "method": "openai-whisper",
     }
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python transcribe.py <video_path>", file=sys.stderr)
-        sys.exit(1)
+    import argparse
 
-    path = sys.argv[1]
+    parser = argparse.ArgumentParser(description="Transcribe a video with word-accurate timestamps.")
+    parser.add_argument("video_path", help="Path to the source video file")
+    parser.add_argument("--no-cache", action="store_true", help="Skip cache lookup and force re-transcription")
+    args = parser.parse_args()
+
+    path = args.video_path
     if not Path(path).exists():
         print(f"File not found: {path}", file=sys.stderr)
         sys.exit(1)
+
+    # Check cache first
+    if not args.no_cache:
+        cached = load_cached(path)
+        if cached:
+            print(f"Using cached transcript ({len(cached['segments'])} segments)", file=sys.stderr)
+            json.dump(cached, sys.stdout, indent=2)
+            print()
+            sys.exit(0)
 
     print(f"Transcribing: {path}", file=sys.stderr)
     result = transcribe(path)
@@ -224,6 +343,10 @@ if __name__ == "__main__":
     seg_count = len(result["segments"])
     dur = result["total_duration"]
     print(f"Done: {seg_count} segments, {dur:.1f}s total", file=sys.stderr)
+
+    # Save to cache
+    save_cache(path, result)
+    print(f"Cached to: {_cache_path(path)}", file=sys.stderr)
 
     json.dump(result, sys.stdout, indent=2)
     print()  # trailing newline

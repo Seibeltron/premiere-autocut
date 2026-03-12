@@ -82,112 +82,156 @@ _FPS_SETTING = {
 }
 
 
+def _get_openai_client():
+    """Return an OpenAI client using env vars, or None if unavailable."""
+    try:
+        from openai import OpenAI
+    except ImportError:
+        return None
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        return None
+    base_url = os.environ.get("OPENAI_BASE_URL", "https://proxy.shopify.ai/v1")
+    return OpenAI(api_key=api_key, base_url=base_url)
+
+
+def _refine_one_clip(args: tuple) -> tuple:
+    """Transcribe the window around a single clip's cut point and determine if extension needed.
+    Designed to run in a thread pool.
+
+    Returns: (index, updated_entry_dict, status_message)
+    """
+    i, entry, next_start_frame, video_path, fps, min_slack_s, target_slack_s, client = args
+
+    cut_s = entry["endFrame"] / fps
+    look_back_s = 1.0
+    look_ahead_s = 4.0
+    win_start = max(0.0, cut_s - look_back_s)
+    win_end = cut_s + look_ahead_s
+
+    import tempfile
+    tmp_mp3 = None
+    words = []
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+            tmp_mp3 = f.name
+        subprocess.run(
+            ["ffmpeg", "-y", "-ss", f"{win_start:.6f}", "-to", f"{win_end:.6f}",
+             "-i", video_path, "-vn", "-acodec", "libmp3lame", "-ab", "64k",
+             "-ac", "1", "-ar", "16000", tmp_mp3],
+            capture_output=True, timeout=30,
+        )
+        with open(tmp_mp3, "rb") as f:
+            response = client.audio.transcriptions.create(
+                model="whisper-1",
+                file=f,
+                response_format="verbose_json",
+                timestamp_granularities=["word"],
+                language="en",
+            )
+        for w in getattr(response, "words", None) or []:
+            words.append({
+                "word": w.word,
+                "start": float(w.start) + win_start,
+                "end": float(w.end) + win_start,
+            })
+    except Exception as e:
+        return i, dict(entry), f"⚠ error: {e}"
+    finally:
+        if tmp_mp3:
+            try:
+                os.unlink(tmp_mp3)
+            except OSError:
+                pass
+
+    # Determine if this cut needs extending
+    straddling = [w for w in words if w["start"] < cut_s < w["end"]]
+    close_after = [w for w in words if cut_s <= w["end"] <= cut_s + 0.4]
+    before = [w for w in words if w["end"] <= cut_s]
+    slack = (cut_s - before[-1]["end"]) if before else 999.0
+
+    needs_extend = bool(straddling or close_after) or slack < min_slack_s
+    entry = dict(entry)
+
+    if needs_extend:
+        if straddling or close_after:
+            after_cut = sorted(
+                [w for w in words if w["start"] >= cut_s - 0.1],
+                key=lambda w: w["start"],
+            )
+            phrase_end_s = None
+            for j in range(len(after_cut) - 1):
+                if after_cut[j]["end"] > cut_s:
+                    if after_cut[j + 1]["start"] - after_cut[j]["end"] > 0.3:
+                        phrase_end_s = after_cut[j]["end"]
+                        break
+            if phrase_end_s is None and after_cut:
+                phrase_end_s = max(w["end"] for w in after_cut)
+            new_end_s = (phrase_end_s or cut_s) + target_slack_s
+        else:
+            new_end_s = cut_s + target_slack_s
+
+        new_end_frame = int(new_end_s * fps)
+        if next_start_frame is not None and next_start_frame > entry["endFrame"]:
+            new_end_frame = min(new_end_frame, next_start_frame - 1)
+
+        if new_end_frame > entry["endFrame"]:
+            extend_ms = (new_end_frame - entry["endFrame"]) / fps * 1000
+            if straddling or close_after:
+                after_cut = sorted(
+                    [w for w in words if w["start"] >= cut_s - 0.1],
+                    key=lambda w: w["start"],
+                )
+                phrase_words = " ".join(
+                    w["word"] for w in after_cut if w["end"] <= new_end_s
+                ).strip()
+                msg = f"⚠ extended +{extend_ms:.0f}ms (phrase: \"{phrase_words[-40:]}\" → pause)"
+            else:
+                msg = f"⚠ extended +{extend_ms:.0f}ms (slack {slack*1000:.0f}ms)"
+            entry["endFrame"] = new_end_frame
+        else:
+            msg = "✓ OK"
+    else:
+        heard_tail = " ".join(w["word"] for w in before[-3:]).strip()
+        msg = f"✓ OK (slack {slack*1000:.0f}ms, ends: \"{heard_tail}\")"
+
+    return i, entry, msg
+
+
 def refine_end_frames(clip_list: list, video_path: str, fps: float,
                       min_slack_s: float = 0.15,
                       target_slack_s: float = 0.35) -> list:
-    """For each clip, extract a short window from the SOURCE VIDEO straddling
-    the cut point, transcribe it, and extend endFrame if a word is being cut off.
-    This is more reliable than concatenation because we check the actual source audio.
+    """Parallel refinement: for each clip, call OpenAI Whisper on the cut-point window
+    and extend endFrame to the next natural phrase pause if a word is being cut off.
+    Uses ThreadPoolExecutor for ~N-clip parallel API calls.
     """
-    import tempfile
-    try:
-        from faster_whisper import WhisperModel
-    except ImportError:
-        print("Warning: faster-whisper not available, skipping refinement.", file=sys.stderr)
+    client = _get_openai_client()
+    if client is None:
+        print("Warning: OpenAI not available (check OPENAI_API_KEY), skipping refinement.",
+              file=sys.stderr)
         return clip_list
 
-    model = WhisperModel("large-v3", device="cpu", compute_type="int8")
-    look_back_s = 1.0   # how far before the cut to start the window
-    look_ahead_s = 4.0  # how far after the cut to search for cut-off words
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    # Build args for each clip
+    args_list = []
+    for i, entry in enumerate(clip_list):
+        next_start = clip_list[i + 1]["startFrame"] if i + 1 < len(clip_list) else None
+        args_list.append((i, entry, next_start, video_path, fps, min_slack_s, target_slack_s, client))
+
+    print(f"\nRefining {len(clip_list)} clips in parallel...", file=sys.stderr)
+    results = [None] * len(clip_list)
+
+    with ThreadPoolExecutor(max_workers=min(6, len(clip_list))) as pool:
+        futures = {pool.submit(_refine_one_clip, a): a[0] for a in args_list}
+        for future in as_completed(futures):
+            i, entry, msg = future.result()
+            results[i] = (entry, msg)
 
     print("\nRefinement report:", file=sys.stderr)
     refined = []
-    for i, entry in enumerate(clip_list):
-        cut_s = entry["endFrame"] / fps  # current cut point in source video time
-
-        win_start = max(0.0, cut_s - look_back_s)
-        win_end = cut_s + look_ahead_s
-
-        tmp_wav = None
-        words = []
-        try:
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-                tmp_wav = f.name
-            subprocess.run(
-                ["ffmpeg", "-y", "-ss", f"{win_start:.6f}", "-to", f"{win_end:.6f}",
-                 "-i", video_path, "-vn", "-acodec", "pcm_s16le", "-ar", "16000",
-                 "-ac", "1", tmp_wav],
-                capture_output=True, timeout=30,
-            )
-            raw_segs, _ = model.transcribe(
-                tmp_wav, language="en", word_timestamps=True,
-                vad_filter=False, no_speech_threshold=0.8, beam_size=1,
-            )
-            for seg in raw_segs:
-                for w in getattr(seg, "words", None) or []:
-                    # Convert window-relative timestamps to source-video timestamps
-                    words.append({
-                        "word": getattr(w, "word", "").strip(),
-                        "start": float(getattr(w, "start", 0)) + win_start,
-                        "end":   float(getattr(w, "end",   0)) + win_start,
-                    })
-        finally:
-            if tmp_wav:
-                try: os.unlink(tmp_wav)
-                except OSError: pass
-
-        # Words that straddle the cut (started before, end after)
-        straddling = [w for w in words if w["start"] < cut_s < w["end"]]
-        # Words that end very close after the cut (within 0.4s — probably clipped)
-        close_after = [w for w in words if cut_s <= w["end"] <= cut_s + 0.4]
-        # Slack: gap between last heard word before cut and the cut point
-        before = [w for w in words if w["end"] <= cut_s]
-        slack = (cut_s - before[-1]["end"]) if before else 999.0
-
-        needs_extend = bool(straddling or close_after) or slack < min_slack_s
-
-        if needs_extend:
-            entry = dict(entry)
-            if straddling or close_after:
-                # Walk forward from the cut to find the first natural pause (gap > 300ms).
-                # This captures full phrases like "become one of the world's..." rather than
-                # stopping at the first straddling word.
-                after_cut = sorted([w for w in words if w["start"] >= cut_s - 0.1],
-                                   key=lambda w: w["start"])
-                phrase_end_s = None
-                for j in range(len(after_cut) - 1):
-                    if after_cut[j]["end"] > cut_s:
-                        gap = after_cut[j + 1]["start"] - after_cut[j]["end"]
-                        if gap > 0.3:
-                            phrase_end_s = after_cut[j]["end"]
-                            break
-                if phrase_end_s is None and after_cut:
-                    phrase_end_s = max(w["end"] for w in after_cut)
-                new_end_s = (phrase_end_s or cut_s) + target_slack_s
-            else:
-                new_end_s = cut_s + target_slack_s
-
-            new_end_frame = int(new_end_s * fps)
-            if i + 1 < len(clip_list):
-                new_end_frame = min(new_end_frame, clip_list[i + 1]["startFrame"] - 1)
-
-            if new_end_frame > entry["endFrame"]:
-                extend_ms = (new_end_frame - entry["endFrame"]) / fps * 1000
-                if straddling or close_after:
-                    phrase_words = " ".join(w["word"] for w in after_cut
-                                           if w["end"] <= new_end_s).strip()
-                    issue = f"phrase: \"{phrase_words[-40:]}\" → pause"
-                else:
-                    issue = f"slack {slack*1000:.0f}ms"
-                print(f"  Clip {i+1}: ⚠ extended +{extend_ms:.0f}ms ({issue})", file=sys.stderr)
-                entry["endFrame"] = new_end_frame
-            else:
-                print(f"  Clip {i+1}: ✓ OK", file=sys.stderr)
-        else:
-            heard_tail = " ".join(w["word"] for w in before[-3:]).strip()
-            print(f"  Clip {i+1}: ✓ OK (slack {slack*1000:.0f}ms, ends: \"{heard_tail}\")",
-                  file=sys.stderr)
-
+    for i, (entry, msg) in enumerate(results):
+        print(f"  Clip {i+1}: {msg}", file=sys.stderr)
         refined.append(entry)
 
     return refined
@@ -212,7 +256,17 @@ def build_timeline(video_path: str, segments: list, timeline_name: str = None,
     if src_fps <= 0:
         src_fps = 24.0
         print(f"Warning: Could not detect source fps, defaulting to {src_fps}", file=sys.stderr)
-    print(f"Source fps: {src_fps}", file=sys.stderr)
+
+    fps_key = min(_FPS_SETTING, key=lambda k: abs(k - src_fps))
+    fps_setting = _FPS_SETTING[fps_key]
+    print(f"Source fps: {fps_setting}", file=sys.stderr)
+    print(f"", file=sys.stderr)
+    print(f"IMPORTANT — Before proceeding, verify Resolve is set to {fps_setting} fps:", file=sys.stderr)
+    print(f"  File > Project Settings > Master Settings", file=sys.stderr)
+    print(f"    Timeline frame rate          → {fps_setting}", file=sys.stderr)
+    print(f"    Playback frame rate          → {fps_setting}", file=sys.stderr)
+    print(f"    Video monitoring format      → {fps_setting}", file=sys.stderr)
+    print(f"", file=sys.stderr)
 
     print(f"Connecting to DaVinci Resolve...", file=sys.stderr)
     resolve = connect_to_resolve()
@@ -227,18 +281,25 @@ def build_timeline(video_path: str, segments: list, timeline_name: str = None,
 
     # Use source fps for all frame calculations
     fps = src_fps
+    # fps_key / fps_setting already computed above for guidance message
 
-    # Import video into media pool
+    # Import video into media pool (or find it if already imported)
     media_pool = project.GetMediaPool()
     print(f"Importing: {Path(video_path).name}", file=sys.stderr)
     imported = media_pool.ImportMedia([video_path])
 
     if not imported:
-        print("ERROR: Failed to import media. Check the file path and format.", file=sys.stderr)
-        return False
-
-    clip = imported[0]
-    print(f"Imported: {clip.GetName()}", file=sys.stderr)
+        # Clip may already be in the media pool — search for it by name
+        video_name = Path(video_path).name
+        root = media_pool.GetRootFolder()
+        clip = next((c for c in (root.GetClipList() or []) if c.GetName() == video_name), None)
+        if clip is None:
+            print("ERROR: Failed to import media and could not find it in media pool.", file=sys.stderr)
+            return False
+        print(f"Found existing clip: {clip.GetName()}", file=sys.stderr)
+    else:
+        clip = imported[0]
+        print(f"Imported: {clip.GetName()}", file=sys.stderr)
 
     # Delete any existing timeline with this name to start fresh
     for i in range(project.GetTimelineCount(), 0, -1):
@@ -248,12 +309,17 @@ def build_timeline(video_path: str, segments: list, timeline_name: str = None,
             print(f"Deleted existing timeline '{timeline_name}'", file=sys.stderr)
             break
 
-    # Set project fps to match source BEFORE creating the timeline.
-    # This only succeeds when there are no other timelines (fresh project).
-    fps_key = min(_FPS_SETTING, key=lambda k: abs(k - fps))
-    fps_setting = _FPS_SETTING[fps_key]
-    result = project.SetSetting("timelineFrameRate", fps_setting)
-    print(f"Set project fps to {fps_setting}: {result}", file=sys.stderr)
+    # Verify project fps matches source — do NOT set it via scripting API as that
+    # only updates the video clock and breaks audio playback (audio plays at wrong speed).
+    # The user must set the project fps manually in Resolve before running this script.
+    project_fps = project.GetSetting("timelineFrameRate")
+    if abs(float(project_fps) - float(fps_setting)) > 0.01:
+        print(f"\nERROR: Project fps ({project_fps}) does not match source fps ({fps_setting}).", file=sys.stderr)
+        print(f"Please set the timeline frame rate manually in Resolve:", file=sys.stderr)
+        print(f"  File > Project Settings > Master Settings > Timeline frame rate > {fps_setting}", file=sys.stderr)
+        print(f"Then re-run this script.", file=sys.stderr)
+        return False
+    print(f"Project fps matches source: {fps_setting} ✓", file=sys.stderr)
 
     # Create an empty timeline — project fps was already set to match source above.
     print(f"Creating empty timeline '{timeline_name}'...", file=sys.stderr)
@@ -270,7 +336,7 @@ def build_timeline(video_path: str, segments: list, timeline_name: str = None,
     merged = [dict(segments[0])]
     for seg in segments[1:]:
         gap = seg["start"] - merged[-1]["end"]
-        if gap < 0.5:
+        if 0 <= gap < 0.5:
             merged[-1]["end"] = seg["end"]
             merged[-1]["text"] = (merged[-1].get("text", "") + " " + seg.get("text", "")).strip()
         else:
@@ -285,12 +351,14 @@ def build_timeline(video_path: str, segments: list, timeline_name: str = None,
     for i, seg in enumerate(merged):
         start_frame = int(seg["start"] * fps)
         raw_end_frame = int(seg["end"] * fps)
-        # Cap end pad so it doesn't bleed into the next clip's start
+        # Cap end pad only when the next clip is chronologically adjacent in source time.
+        # Non-chronological ordering (e.g. GPT-reordered cold open) means the next clip's
+        # startFrame may be far earlier in source time — capping there would crush the clip.
+        end_frame = raw_end_frame + end_pad_frames
         if i + 1 < len(merged):
             next_start_frame = int(merged[i + 1]["start"] * fps)
-            end_frame = min(raw_end_frame + end_pad_frames, next_start_frame - 1)
-        else:
-            end_frame = raw_end_frame + end_pad_frames
+            if next_start_frame > raw_end_frame:
+                end_frame = min(end_frame, next_start_frame - 1)
         if end_frame <= start_frame:
             end_frame = start_frame + 1
         clip_list.append({
@@ -298,6 +366,12 @@ def build_timeline(video_path: str, segments: list, timeline_name: str = None,
             "startFrame": start_frame,
             "endFrame": end_frame,
         })
+
+    # Auto-skip refine if segments came from trim_pass (already word-boundary aligned)
+    has_trim_notes = any("trim_note" in seg for seg in segments)
+    if has_trim_notes and refine:
+        print("Segments from trim_pass detected — skipping refine pass (already word-aligned).", file=sys.stderr)
+        refine = False
 
     if refine:
         print(f"Refining end frames ({len(clip_list)} clips)...", file=sys.stderr)
