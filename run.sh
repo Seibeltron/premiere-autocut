@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# resolve-autocut launcher
+# premiere-autocut launcher
 # Auto-creates a Python venv with required dependencies on first run.
+#
+# Requires: Premiere Pro open with MCP Bridge (CEP) panel started at /tmp/premiere-mcp-bridge
 #
 # Usage:
 #   ./run.sh <video> <segments.json> [--timeline-name "Name"] [--no-refine]
