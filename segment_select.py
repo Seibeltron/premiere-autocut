@@ -18,6 +18,7 @@ Usage:
 
 import json
 import os
+import random
 import sys
 from pathlib import Path
 from typing import Dict, List
@@ -36,13 +37,20 @@ def _has_filler_start(text: str) -> bool:
     return any(lower.startswith(f) for f in FILLER_STARTS)
 
 
+def _is_multi_source(segments: List[Dict]) -> bool:
+    sources = {s.get("source_video") for s in segments if s.get("source_video")}
+    return len(sources) > 1
+
+
 def _fmt_seg_list(segments: List[Dict]) -> str:
     lines = []
     for i, seg in enumerate(segments):
         dur = seg["end"] - seg["start"]
         filler = " [FILLER START]" if _has_filler_start(seg.get("text", "")) else ""
+        source = seg.get("source_video", "")
+        source_label = f" [SRC:{Path(source).name}]" if source else ""
         lines.append(
-            f"[{i}] {seg['start']:.1f}s–{seg['end']:.1f}s ({dur:.1f}s){filler}: {seg.get('text', '')}"
+            f"[{i}] {seg['start']:.1f}s–{seg['end']:.1f}s ({dur:.1f}s){filler}{source_label}: {seg.get('text', '')}"
         )
     return "\n".join(lines)
 
@@ -52,6 +60,7 @@ def select_segments(
     topic: str,
     target_duration: float,
     cold_open: bool = True,
+    mix: bool = False,
 ) -> Dict:
     """Use GPT-4o to select coherent segments from a transcript."""
     try:
@@ -71,7 +80,18 @@ def select_segments(
         return {"error": "No segments in transcript"}
 
     total_dur = transcript.get("total_duration", 0)
-    seg_text = _fmt_seg_list(segments)
+    multi_source = _is_multi_source(segments)
+
+    # Optionally shuffle to prevent source-file clustering bias
+    shuffle_order = list(range(len(segments)))
+    if mix and multi_source:
+        random.shuffle(shuffle_order)
+        segments_for_gpt = [segments[i] for i in shuffle_order]
+        print(f"Multi-source shuffle enabled ({len(set(s.get('source_video') for s in segments if s.get('source_video')))} sources)", file=sys.stderr)
+    else:
+        segments_for_gpt = segments
+
+    seg_text = _fmt_seg_list(segments_for_gpt)
 
     cold_open_instruction = (
         "4. Identify the single best COLD OPEN: a compelling 8–15s moment that works as a "
@@ -141,11 +161,24 @@ Prefer clips that START with a new, complete idea rather than a callback.
   belong ONLY as the absolute final clip. If a great clip ends with sign-off bleed, note it — \
   trim_pass.py will handle it."""
 
+    multi_source_note = ""
+    if multi_source:
+        source_names = list(dict.fromkeys(
+            Path(s.get("source_video", "")).name
+            for s in segments if s.get("source_video")
+        ))
+        shuffle_notice = " (segments have been shuffled to prevent source-file clustering bias — select the best content regardless of [SRC:] label)" if mix else ""
+        multi_source_note = (
+            f"\nMULTI-SOURCE NOTE: Segments come from {len(source_names)} source files: "
+            f"{', '.join(source_names)}.{shuffle_notice} "
+            f"Each segment is labeled [SRC:filename]. You may freely mix segments from different sources.\n"
+        )
+
     user_prompt = f"""Create a {target_duration:.0f}-second highlight reel from this Shopify all-hands transcript.
 
 FOCUS TOPIC: "{topic}"
 TARGET DURATION: {target_duration:.0f}s (acceptable range: {target_duration * 0.8:.0f}s – {target_duration * 1.2:.0f}s)
-TOTAL SOURCE DURATION: {total_dur:.0f}s
+TOTAL SOURCE DURATION: {total_dur:.0f}s{multi_source_note}
 
 SELECTION RULES:
 1. Segments must be relevant to the focus topic
@@ -206,8 +239,14 @@ Respond with JSON only, no markdown:
     cold_open_idx = gpt_result.get("cold_open_index")
     selected_indices = gpt_result.get("selected_indices", [])
 
-    # Validate indices
-    selected_indices = [i for i in selected_indices if isinstance(i, int) and 0 <= i < len(segments)]
+    # Validate indices against the (possibly shuffled) list GPT saw
+    selected_indices = [i for i in selected_indices if isinstance(i, int) and 0 <= i < len(segments_for_gpt)]
+
+    # Unmap shuffled indices back to positions in the original segments list
+    if mix and multi_source:
+        selected_indices = [shuffle_order[i] for i in selected_indices]
+        if cold_open_idx is not None and isinstance(cold_open_idx, int) and 0 <= cold_open_idx < len(shuffle_order):
+            cold_open_idx = shuffle_order[cold_open_idx]
 
     # Promote cold open to position 0 (if not already there)
     if cold_open_idx is not None and cold_open_idx in selected_indices:
@@ -299,6 +338,8 @@ if __name__ == "__main__":
                         help="Target duration in seconds (e.g. 180 for 3 minutes)")
     parser.add_argument("--no-cold-open", action="store_true",
                         help="Disable cold open detection")
+    parser.add_argument("--mix", action="store_true",
+                        help="Shuffle multi-source segments before GPT sees them to prevent source-file clustering bias")
     parser.add_argument("--output", "-o", default=None,
                         help="Write segments JSON to this file (default: stdout)")
     args = parser.parse_args()
@@ -320,6 +361,7 @@ if __name__ == "__main__":
         topic=args.topic,
         target_duration=args.duration,
         cold_open=not args.no_cold_open,
+        mix=args.mix,
     )
 
     if "error" in result:

@@ -24,9 +24,11 @@ from typing import Dict, List, Optional
 
 def _words_for_segment(seg: Dict, all_words: List[Dict]) -> List[Dict]:
     """Return words from the transcript that fall within the segment's time range."""
+    source = seg.get("source_video")
     return [
         w for w in all_words
-        if w["start"] >= seg["start"] - 0.1 and w["end"] <= seg["end"] + 0.1
+        if (source is None or w.get("source_video") == source)
+        and w["start"] >= seg["start"] - 0.1 and w["end"] <= seg["end"] + 0.1
     ]
 
 
